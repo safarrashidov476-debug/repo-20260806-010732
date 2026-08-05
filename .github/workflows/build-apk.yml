@@ -1,0 +1,131 @@
+name: Build RHVoice APK (avtomatik + imzolash)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sizning repo fayllarini olish
+        uses: actions/checkout@v4
+        with:
+          path: my-files
+
+      - name: RHVoice manba kodini yuklab olish
+        run: git clone --recursive https://github.com/RHVoice/RHVoice.git rhvoice-src
+
+      - name: Tizim paketlarini o'rnatish
+        run: sudo apt-get update && sudo apt-get install -y scons pkg-config build-essential
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build-tools o'rnatish (zipalign/apksigner uchun)
+        run: sdkmanager --install "build-tools;34.0.0"
+
+      - name: Imzolash kaliti (keystore) tayyorlash
+        run: |
+          if [ ! -f my-files/release.keystore ]; then
+            echo "Kalit topilmadi - yangi kalit yaratilmoqda (faqat bir marta sodir bo'ladi)..."
+            keytool -genkeypair -v \
+              -keystore my-files/release.keystore \
+              -alias rhvoiceuz \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass rhvoice123 -keypass rhvoice123 \
+              -dname "CN=RHVoice UZ, OU=Personal, O=Personal, L=Tashkent, S=Tashkent, C=UZ"
+            cd my-files
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add release.keystore
+            git commit -m "Avtomatik: imzolash kaliti yaratildi"
+            git push
+          else
+            echo "Kalit allaqachon mavjud - shu kalit ishlatiladi."
+          fi
+
+      - name: Preprocessor faylini joylashtirish
+        run: |
+          TARGET_DIR="rhvoice-src/src/android/RHVoice-core/src/main/java/com/github/olga_yakovleva/rhvoice/android"
+          cp my-files/PhoneNumberPreprocessor.java "$TARGET_DIR/PhoneNumberPreprocessor.java"
+
+      - name: settings.xml faylini almashtirish
+        run: |
+          TARGET_XML="rhvoice-src/src/android/RHVoice-core/src/main/res/xml/settings.xml"
+          cp my-files/settings.xml "$TARGET_XML"
+
+      - name: RHVoiceService.java kodini avtomatik moslash
+        run: |
+          FILE="rhvoice-src/src/android/RHVoice-core/src/main/java/com/github/olga_yakovleva/rhvoice/android/RHVoiceService.java"
+          python3 my-files/patch_service.py "$FILE"
+
+      - name: Gradle uchun xotirani oshirish
+        run: |
+          echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError" >> gradle.properties
+          echo "org.gradle.daemon=false" >> gradle.properties
+          echo "org.gradle.parallel=false" >> gradle.properties
+        working-directory: rhvoice-src/src/android
+
+      - name: gradlew huquqi
+        run: chmod +x ./gradlew
+        working-directory: rhvoice-src/src/android
+
+      - name: APK yig'ish (faqat kerakli variant)
+        run: ./gradlew assembleStableRelease --stacktrace --no-daemon
+        working-directory: rhvoice-src/src/android
+
+      - name: APK'ni topish
+        id: find_apk
+        run: |
+          APK_DIR="RHVoice-core/build/outputs/apk/stable/release"
+          APK_FILE=$(find "$APK_DIR" -name "*.apk" | head -n 1)
+          echo "apk_path=rhvoice-src/src/android/$APK_FILE" >> $GITHUB_OUTPUT
+        working-directory: rhvoice-src/src/android
+
+      - name: APK'ni tekislash va imzolash
+        id: sign_apk
+        run: |
+          BUILD_TOOLS_DIR=$(find $ANDROID_HOME/build-tools -maxdepth 1 -type d -name "34*" | sort -V | tail -n 1)
+          ZIPALIGN="$BUILD_TOOLS_DIR/zipalign"
+          APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
+
+          UNSIGNED_APK="${{ steps.find_apk.outputs.apk_path }}"
+          ALIGNED_APK="aligned-unsigned.apk"
+          SIGNED_APK="rhvoice-uz-signed.apk"
+
+          "$ZIPALIGN" -v -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
+          "$APKSIGNER" sign \
+            --ks my-files/release.keystore \
+            --ks-pass pass:rhvoice123 \
+            --key-pass pass:rhvoice123 \
+            --out "$SIGNED_APK" \
+            "$ALIGNED_APK"
+
+          echo "signed_apk_path=$SIGNED_APK" >> $GITHUB_OUTPUT
+
+      - name: Imzolangan APK'ni Artifacts'ga yuklash
+        uses: actions/upload-artifact@v4
+        with:
+          name: rhvoice-apk-signed
+          path: ${{ steps.sign_apk.outputs.signed_apk_path }}
+
+      - name: Tayyor Release yaratish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "Tayyor imzolangan APK - build #${{ github.run_number }}"
+          files: ${{ steps.sign_apk.outputs.signed_apk_path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
